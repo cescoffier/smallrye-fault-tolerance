@@ -52,7 +52,7 @@ public class AsynchronousCircuitBreakerTest {
                 helloService.hello(AsyncHelloService.Result.FAILURE).get();
                 Assert.fail();
             } catch (ExecutionException e) {
-                Assert.assertTrue("Unexpected expection on iteration " + i + ": " + e, e.getCause() instanceof IOException);
+                Assert.assertTrue("Unexpected exception on iteration " + i + ": " + e, e.getCause() instanceof IOException);
             }
         }
         // Circuit should be open now
