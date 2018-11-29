@@ -16,17 +16,19 @@
 
 package io.smallrye.faulttolerance;
 
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
-import java.security.PrivilegedActionException;
-import java.time.Duration;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
-import java.util.function.Supplier;
+import com.netflix.hystrix.*;
+import com.netflix.hystrix.HystrixCommand.Setter;
+import com.netflix.hystrix.exception.HystrixRuntimeException;
+import com.netflix.hystrix.exception.HystrixRuntimeException.FailureType;
+import io.smallrye.faulttolerance.config.*;
+import org.eclipse.microprofile.config.Config;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.eclipse.microprofile.faulttolerance.*;
+import org.eclipse.microprofile.faulttolerance.exceptions.BulkheadException;
+import org.eclipse.microprofile.faulttolerance.exceptions.CircuitBreakerOpenException;
+import org.eclipse.microprofile.faulttolerance.exceptions.FaultToleranceException;
+import org.eclipse.microprofile.faulttolerance.exceptions.TimeoutException;
+import org.jboss.logging.Logger;
 
 import javax.annotation.Priority;
 import javax.enterprise.inject.Intercepted;
@@ -35,36 +37,13 @@ import javax.inject.Inject;
 import javax.interceptor.AroundInvoke;
 import javax.interceptor.Interceptor;
 import javax.interceptor.InvocationContext;
-
-import org.eclipse.microprofile.config.Config;
-import org.eclipse.microprofile.config.inject.ConfigProperty;
-import org.eclipse.microprofile.faulttolerance.Asynchronous;
-import org.eclipse.microprofile.faulttolerance.CircuitBreaker;
-import org.eclipse.microprofile.faulttolerance.Fallback;
-import org.eclipse.microprofile.faulttolerance.FallbackHandler;
-import org.eclipse.microprofile.faulttolerance.Retry;
-import org.eclipse.microprofile.faulttolerance.exceptions.BulkheadException;
-import org.eclipse.microprofile.faulttolerance.exceptions.CircuitBreakerOpenException;
-import org.eclipse.microprofile.faulttolerance.exceptions.FaultToleranceException;
-import org.eclipse.microprofile.faulttolerance.exceptions.TimeoutException;
-import org.jboss.logging.Logger;
-
-import com.netflix.hystrix.HystrixCircuitBreaker;
-import com.netflix.hystrix.HystrixCommand;
-import com.netflix.hystrix.HystrixCommand.Setter;
-import com.netflix.hystrix.HystrixCommandGroupKey;
-import com.netflix.hystrix.HystrixCommandKey;
-import com.netflix.hystrix.HystrixCommandProperties;
-import com.netflix.hystrix.HystrixThreadPoolKey;
-import com.netflix.hystrix.HystrixThreadPoolProperties;
-import com.netflix.hystrix.exception.HystrixRuntimeException;
-import com.netflix.hystrix.exception.HystrixRuntimeException.FailureType;
-
-import io.smallrye.faulttolerance.config.BulkheadConfig;
-import io.smallrye.faulttolerance.config.CircuitBreakerConfig;
-import io.smallrye.faulttolerance.config.FallbackConfig;
-import io.smallrye.faulttolerance.config.FaultToleranceOperation;
-import io.smallrye.faulttolerance.config.TimeoutConfig;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.security.PrivilegedActionException;
+import java.time.Duration;
+import java.util.concurrent.*;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * <h2>Implementation notes:</h2>
@@ -121,8 +100,8 @@ public class HystrixCommandInterceptor {
     @SuppressWarnings("unchecked")
     @Inject
     public HystrixCommandInterceptor(@ConfigProperty(name = "MP_Fault_Tolerance_NonFallback_Enabled", defaultValue = "true") Boolean nonFallBackEnable,
-            Config config, FallbackHandlerProvider fallbackHandlerProvider, FaultToleranceOperationProvider faultToleranceOperationProvider,
-            CommandListenersProvider listenersProvider, @Intercepted Bean<?> interceptedBean, MetricsCollectorFactory metricsCollectorFactory) {
+                                     Config config, FallbackHandlerProvider fallbackHandlerProvider, FaultToleranceOperationProvider faultToleranceOperationProvider,
+                                     CommandListenersProvider listenersProvider, @Intercepted Bean<?> interceptedBean, MetricsCollectorFactory metricsCollectorFactory) {
         this.nonFallBackEnable = nonFallBackEnable;
         this.syncCircuitBreakerEnabled = config.getOptionalValue(SYNC_CIRCUIT_BREAKER_KEY, Boolean.class).orElse(true);
         this.fallbackHandlerProvider = fallbackHandlerProvider;
@@ -165,8 +144,7 @@ public class HystrixCommandInterceptor {
 
         if (metadata.operation.isAsync()) {
             LOGGER.debugf("Queue up command for async execution: %s", metadata.operation);
-            return new AsyncFuture(CompositeCommand.createAndQueue(() -> executeCommand(commandFactory, retryContext, metadata, ctx, syncCircuitBreaker),
-                    metadata.operation, ctx, metricsCollectorFactory.isMetricsEnabled() ? metricsCollectorFactory.getRegistry() : null));
+            return executeCommandAsync(commandFactory, retryContext, metadata, ctx, syncCircuitBreaker);
         } else {
             LOGGER.debugf("Sync execution: %s]", metadata.operation);
             return executeCommand(commandFactory, retryContext, metadata, ctx, syncCircuitBreaker);
@@ -174,7 +152,7 @@ public class HystrixCommandInterceptor {
     }
 
     private Object executeCommand(Function<Supplier<Object>, SimpleCommand> commandFactory, RetryContext retryContext, CommandMetadata metadata,
-            ExecutionContextWithInvocationContext ctx, SynchronousCircuitBreaker syncCircuitBreaker) throws Exception {
+                                  ExecutionContextWithInvocationContext ctx, SynchronousCircuitBreaker syncCircuitBreaker) throws Exception {
 
         MetricsCollector metricsCollector = metricsCollectorFactory.createCollector(metadata.operation, retryContext, metadata.poolKey);
         metricsCollector.init(syncCircuitBreaker);
@@ -216,8 +194,57 @@ public class HystrixCommandInterceptor {
         }
     }
 
+    private CompletionStage<Object> executeCommandAsync(Function<Supplier<Object>, SimpleCommand> commandFactory, RetryContext retryContext, CommandMetadata metadata,
+                                                        ExecutionContextWithInvocationContext ctx, SynchronousCircuitBreaker syncCircuitBreaker) throws Exception {
+
+        MetricsCollector metricsCollector = metricsCollectorFactory.createCollector(metadata.operation, retryContext, metadata.poolKey);
+        metricsCollector.init(syncCircuitBreaker);
+
+        CompletableFuture<Object> future = new CompletableFuture<>();
+
+        if (retryContext != null) {
+            LOGGER.debugf("Executing %s with %s", metadata.operation, retryContext);
+        }
+
+        Supplier<Object> fallback = null;
+        if (retryContext == null || retryContext.isLastAttempt()) {
+            fallback = metadata.getFallback(ctx);
+        }
+        SimpleCommand command = commandFactory.apply(fallback);
+
+        metricsCollector.beforeExecute(command);
+        command.toObservable()
+                .doOnNext((x) -> metricsCollector.afterSuccess(command))
+                .doAfterTerminate(() -> metricsCollector.afterExecute(command))
+                .doOnError(t -> {
+                    if (t instanceof HystrixRuntimeException) {
+                        metricsCollector.onError(command, (HystrixRuntimeException) t);
+                        Exception res = processHystrixRuntimeException((HystrixRuntimeException) t, retryContext, metadata.operation.getMethod(),
+                                syncCircuitBreaker);
+                        metricsCollector.onProcessedError(command, res);
+                    }
+                })
+                .subscribe(
+                        x -> {
+                            if (syncCircuitBreaker != null) {
+                                syncCircuitBreaker.executionSucceeded();
+                            }
+                            future.complete(x);
+                        },
+                        err -> {
+                            if (syncCircuitBreaker != null) {
+                                syncCircuitBreaker.executionFailed();
+                            }
+                            future.completeExceptionally(unwrapExecutionException(err));
+                        }
+                );
+
+        return future;
+
+    }
+
     private static Exception processHystrixRuntimeException(HystrixRuntimeException e, RetryContext retryContext, Method method,
-            SynchronousCircuitBreaker syncCircuitBreaker) {
+                                                            SynchronousCircuitBreaker syncCircuitBreaker) {
 
         FailureType failureType = e.getFailureType();
         LOGGER.tracef("Hystrix runtime failure [%s] with cause %s when invoking %s", failureType, e.getCause(), method);
@@ -274,6 +301,9 @@ public class HystrixCommandInterceptor {
     }
 
     private static Exception getCause(HystrixRuntimeException e) {
+        if (e.getCause() instanceof java.util.concurrent.ExecutionException  && e.getCause().getCause() instanceof Exception) {
+            return (Exception) e.getCause().getCause();
+        }
         return (e.getCause() instanceof Exception) ? (Exception) e.getCause() : e;
     }
 
@@ -432,6 +462,20 @@ public class HystrixCommandInterceptor {
             return fallback;
         }
 
+    }
+
+    private Throwable unwrapExecutionException(Throwable e) {
+        if (e instanceof HystrixRuntimeException) {
+            Exception res;
+            HystrixRuntimeException hystrixRuntimeException = (HystrixRuntimeException) e;
+            if (FailureType.COMMAND_EXCEPTION.equals(hystrixRuntimeException.getFailureType())) {
+                res = getCause(hystrixRuntimeException);
+            } else {
+                res = errorProcessingHystrixRuntimeException(hystrixRuntimeException);
+            }
+            return res;
+        }
+        return e;
     }
 
     static class AsyncFuture implements Future<Object> {
